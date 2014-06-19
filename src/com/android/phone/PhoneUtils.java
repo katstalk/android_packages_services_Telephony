@@ -138,6 +138,10 @@ public class PhoneUtils {
         }
     }
 
+    /** USSD information used to aggregate all USSD messages */
+    private static AlertDialog sUssdDialog = null;
+    private static StringBuilder sUssdMsg = new StringBuilder();
+
     /**
      * Handler that tracks the connections and updates the value of the
      * Mute settings for each connection as needed.
@@ -725,11 +729,6 @@ public class PhoneUtils {
             // we dialed an MMI (see below).
         }
 
-        // Now that the call is successful, we can save the gateway info for the call
-        if (callGateway != null) {
-            callGateway.setGatewayInfoForConnection(connection, gatewayInfo);
-        }
-
         int phoneType = phone.getPhoneType();
 
         // On GSM phones, null is returned for MMI codes
@@ -741,6 +740,11 @@ public class PhoneUtils {
                 status = CALL_STATUS_FAILED;
             }
         } else {
+            // Now that the call is successful, we can save the gateway info for the call
+            if (callGateway != null) {
+                callGateway.setGatewayInfoForConnection(connection, gatewayInfo);
+            }
+
             if (phoneType == PhoneConstants.PHONE_TYPE_CDMA) {
                 updateCdmaCallStateOnNewOutgoingCall(app, connection);
             }
@@ -834,6 +838,33 @@ public class PhoneUtils {
                 // Send the empty flash
                 if (DBG) Log.d(LOG_TAG, "onReceive: (CDMA) sending empty flash to network");
                 switchHoldingAndActive(phone.getBackgroundCall());
+            }
+        }
+    }
+
+    static void swap() {
+        final PhoneGlobals mApp = PhoneGlobals.getInstance();
+        if (!okToSwapCalls(mApp.mCM)) {
+            // TODO: throw an error instead?
+            return;
+        }
+
+        // Swap the fg and bg calls.
+        // In the future we may provide some way for user to choose among
+        // multiple background calls, for now, always act on the first background call.
+        PhoneUtils.switchHoldingAndActive(mApp.mCM.getFirstActiveBgCall());
+
+        // If we have a valid BluetoothPhoneService then since CDMA network or
+        // Telephony FW does not send us information on which caller got swapped
+        // we need to update the second call active state in BluetoothPhoneService internally
+        if (mApp.mCM.getBgPhone().getPhoneType() == PhoneConstants.PHONE_TYPE_CDMA) {
+            final IBluetoothHeadsetPhone btPhone = mApp.getBluetoothPhoneService();
+            if (btPhone != null) {
+                try {
+                    btPhone.cdmaSwapSecondCallState();
+                } catch (RemoteException e) {
+                    Log.e(LOG_TAG, Log.getStackTraceString(new Throwable()));
+                }
             }
         }
     }
@@ -1105,18 +1136,33 @@ public class PhoneUtils {
                 // displaying system alert dialog on the screen instead of
                 // using another activity to display the message.  This
                 // places the message at the forefront of the UI.
-                AlertDialog newDialog = new AlertDialog.Builder(context)
-                        .setMessage(text)
-                        .setPositiveButton(R.string.ok, null)
-                        .setCancelable(true)
-                        .create();
 
-                newDialog.getWindow().setType(
-                        WindowManager.LayoutParams.TYPE_SYSTEM_DIALOG);
-                newDialog.getWindow().addFlags(
-                        WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+                if (sUssdDialog == null) {
+                    sUssdDialog = new AlertDialog.Builder(context)
+                            .setPositiveButton(R.string.ok, null)
+                            .setCancelable(true)
+                            .setOnDismissListener(new DialogInterface.OnDismissListener() {
+                                @Override
+                                public void onDismiss(DialogInterface dialog) {
+                                    sUssdMsg.setLength(0);
+                                }
+                            })
+                            .create();
 
-                newDialog.show();
+                    sUssdDialog.getWindow().setType(
+                            WindowManager.LayoutParams.TYPE_SYSTEM_DIALOG);
+                    sUssdDialog.getWindow().addFlags(
+                            WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+                }
+                if (sUssdMsg.length() != 0) {
+                    sUssdMsg
+                            .insert(0, "\n")
+                            .insert(0, app.getResources().getString(R.string.ussd_dialog_sep))
+                            .insert(0, "\n");
+                }
+                sUssdMsg.insert(0, text);
+                sUssdDialog.setMessage(sUssdMsg.toString());
+                sUssdDialog.show();
             } else {
                 if (DBG) log("USSD code has requested user input. Constructing input dialog.");
 
@@ -2014,38 +2060,6 @@ public class PhoneUtils {
                 sConnectionMuteTable.put(cn, Boolean.valueOf(muted));
             }
         }
-    }
-    
-    /**
-     * Reset the audio stream volume to fix the low in-call volume bug.
-     *
-     * Due to a bug in the OMX system, the audio stream volume is set to 0 after it was set to it's default volume.
-     * Calling PhoneUtils.resetAudioStreamVolume() triggers the system to reset the volume.
-     *
-     * This should be called on every place where is switched between audio modes.
-     *
-     * REMARK: I think it only appears on the voice call stream, but to be sure I also do it on the bluetooth stream.
-     */
-    static void resetAudioStreamVolume() {
-        PhoneGlobals app = PhoneGlobals.getInstance();
-        BluetoothManager btManager = app.getBluetoothManager();
-        AudioManager audioManager = (AudioManager) app.getSystemService(Context.AUDIO_SERVICE);
-        // determine actual streamType
-        int streamType = AudioManager.STREAM_VOICE_CALL;
-        if (btManager.isBluetoothHeadsetAudioOn()) {
-            streamType = AudioManager.STREAM_BLUETOOTH_SCO;
-        }
-        // determine volume and 1 level lower volume (lowest level can be 0)
-        int volume = audioManager.getStreamVolume(streamType);
-        int lowerVolume = volume - 1;
-        if (lowerVolume < 0) {
-            lowerVolume = 0;
-        }
-        log("resetAudioStreamVolume (streamType=" + streamType + ", streamVolume=" + volume + ")...");
-        // It's important to change it to another volume before restoring the original volume,
-        // otherwise the volume change will NOT be triggered!!
-        audioManager.setStreamVolume(streamType, lowerVolume, 0);
-        audioManager.setStreamVolume(streamType, volume, 0);
     }
 
     static boolean isInEmergencyCall(CallManager cm) {
